@@ -13,6 +13,7 @@ import threading
 from time import sleep
 from abc import ABC, abstractmethod
 import textwrap
+from threading import Thread, Event
 
 DEFAULT_CONFIGURATION_FILE_PATH = "/etc/fw-fanctrl/config.json"
 SOCKETS_FOLDER_PATH = "/run/fw-fanctrl"
@@ -483,7 +484,7 @@ class EctoolHardwareController(HardwareController, ABC):
         pass
 
 
-class FanController:
+class FanController (Thread):
     hardwareController = None
     socketController = None
     configuration = None
@@ -491,9 +492,11 @@ class FanController:
     speed = 0
     tempHistory = collections.deque([0] * 100, maxlen=100)
     active = True
-    timecount = 0
+    update = None
 
-    def __init__(self, hardwareController, socketController, configPath, strategyName):
+    def __init__(self, hardwareController, socketController, configPath, strategyName, event):
+        Thread.__init__(self)
+
         self.hardwareController = hardwareController
         self.socketController = socketController
         self.configuration = Configuration(configPath)
@@ -504,6 +507,8 @@ class FanController:
         t = threading.Thread(target=self.socketController.startServerSocket, args=[self.commandManager])
         t.daemon = True
         t.start()
+
+        self.update = event
 
     def getActualTemperature(self):
         return self.hardwareController.getTemperature()
@@ -518,18 +523,23 @@ class FanController:
     def pause(self):
         self.active = False
         self.hardwareController.pause()
+        self.update.set()
 
     def resume(self):
         self.active = True
         self.hardwareController.resume()
+        self.update.set()
+        self.update.clear()
 
     def overwriteStrategy(self, strategyName):
         self.overwrittenStrategy = self.configuration.getStrategy(strategyName)
-        self.timecount = 0
+        self.update.set()
+        self.update.clear()
 
     def clearOverwrittenStrategy(self):
         self.overwrittenStrategy = None
-        self.timecount = 0
+        self.update.set()
+        self.update.clear()
 
     def getCurrentStrategy(self):
         if self.overwrittenStrategy is not None:
@@ -613,21 +623,15 @@ class FanController:
     def run(self, debug=True):
         try:
             while True:
-                if self.active:
+                while not self.update.wait(self.getCurrentStrategy().fanSpeedUpdateFrequency): # block fan update until every "fanSpeedUpdateFrequency" seconds
                     temp = self.getActualTemperature()
-                    # update fan speed every "fanSpeedUpdateFrequency" seconds
-                    if self.timecount % self.getCurrentStrategy().fanSpeedUpdateFrequency == 0:
-                        self.adaptSpeed(temp)
-                        self.timecount = 0
 
+                    self.adaptSpeed(temp)
                     self.tempHistory.append(temp)
 
                     if debug:
                         self.printState()
-                    self.timecount += 1
-                    sleep(1)
-                else:
-                    sleep(5)
+
         except InvalidStrategyException as e:
             print(f"[Error] > Missing strategy, exiting for safety reasons: {e.args[0]}", file=sys.stderr)
         except Exception as e:
@@ -647,8 +651,7 @@ def main():
         if args.hardware_controller == "ectool":
             hardwareController = EctoolHardwareController(noBatterySensorMode=args.no_battery_sensors)
 
-        fan = FanController(hardwareController=hardwareController, socketController=socketController,
-                            configPath=args.config, strategyName=args.strategy)
+        fan = FanController(hardwareController=hardwareController, socketController=socketController, configPath=args.config, strategyName=args.strategy, event=Event())
         fan.run(debug=not args.silent)
     else:
         try:
